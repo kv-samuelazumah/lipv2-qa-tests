@@ -1,0 +1,2 @@
+-r 13-lip-v2/requirements.txt
+locust==2.46.7

@@ -1,0 +1,13 @@
+.DS_Store
+
+models
+__pycache__
+.env
+.venv
+dist
+
+unspsc-search-corpus-v260801.1.jsonl
+performance/results/
+13-lip-v2/companies-house.csv
+13-lip-v2/test-result.json
+13-lip-v2/qa/*-backup-*.json
