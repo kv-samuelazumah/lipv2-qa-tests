@@ -12,12 +12,12 @@ Run these steps from the repository root. Python 3 and Docker are required.
 2. Configure `13-lip-v2/.env` for the local services:
 
    ```dotenv
-   POSTGRES_HOST=localhost
-   POSTGRES_PORT=55432
-   POSTGRES_DB=unspsc
-   POSTGRES_USER=postgres
-   POSTGRES_PASSWORD=postgres
-   AWS_ENDPOINT_URL=http://localhost:4566
+   POSTGRES_HOST=
+   POSTGRES_PORT=
+   POSTGRES_DB=
+   POSTGRES_USER=
+   POSTGRES_PASSWORD=
+   AWS_ENDPOINT_URL=
    ```
 
 3. Start the services:
