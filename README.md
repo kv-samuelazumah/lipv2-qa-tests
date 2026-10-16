@@ -48,5 +48,3 @@ To start the worker manually, run this from the repository root:
 cd 13-lip-v2
 ../.venv/bin/python main.py
 ```
-
-Press Ctrl+C to stop it. This step is optional for Locust tests.
