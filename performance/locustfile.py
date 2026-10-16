@@ -4,6 +4,7 @@ from locust.runners import LocalRunner
 import sys
 import importlib
 import gevent
+import logging
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,11 +14,12 @@ from dotenv import load_dotenv
 load_dotenv(ROOT / "13-lip-v2" / ".env")
 
 from performance.common import WorkerScenario, run_all_scenarios, save_summary
+from performance.data_setup import DataPreparation
 
 
 def discover_scenarios():
     scenarios = {}
-    for path in sorted((ROOT / "performance" / "tests").glob("test_*.py")):
+    for path in sorted((ROOT / "performance" / "tests").glob("[0-9][0-9][0-9]_test_*.py")):
         module = importlib.import_module(f"performance.tests.{path.stem}")
         classes = [value for value in vars(module).values()
                    if isinstance(value, type) and issubclass(value, WorkerScenario)
@@ -25,7 +27,7 @@ def discover_scenarios():
         if len(classes) > 1:
             raise ValueError(f"Define only one WorkerScenario subclass in {path.name}")
         if classes:
-            scenarios[path.stem.removeprefix("test_")] = classes[0]
+            scenarios[path.stem.replace("_test_", "_", 1)] = classes[0]
     return scenarios
 
 
@@ -34,7 +36,7 @@ SCENARIOS = discover_scenarios()
 
 @events.init_command_line_parser.add_listener
 def arguments(parser, **kwargs):
-    parser.add_argument("--scenario", choices=["all", *sorted(SCENARIOS)], default="configured_tax_exclusion",
+    parser.add_argument("--scenario", choices=["all", *sorted(SCENARIOS)], default="001_exclude_vat_payments_from_spend",
                         help="Test scenario, or all to run discovered scenarios sequentially")
     parser.add_argument("--interval", type=float, default=1.0, help="Seconds between sends per producer")
     parser.add_argument("--timeout", type=float, default=30.0, help="Completion/drain deadline in seconds")
@@ -43,6 +45,13 @@ def arguments(parser, **kwargs):
     parser.add_argument("--p99-ms", type=float, default=1500.0, help="Maximum successful end-to-end p99")
     parser.add_argument("--min-rps", type=float, default=1.0, help="Minimum verified completions/sec including drain")
     parser.add_argument("--min-samples", type=int, default=10, help="Minimum submitted sample count")
+
+
+@events.init.add_listener
+def hide_default_statistics(environment, **kwargs):
+    # Locust's console tables use this dedicated logger; metrics and exports
+    # remain available, and application/Locust warnings are still visible.
+    logging.getLogger("locust.stats_logger").setLevel(logging.WARNING)
 
 
 @events.init.add_listener
@@ -65,7 +74,9 @@ def start(environment, **kwargs):
         gevent.spawn(environment.runner.quit)
         return
     run = environment.scenario_run = SCENARIOS[environment.parsed_options.scenario](environment)
+    run.data_preparation = DataPreparation(run)
     try:
+        run.data_preparation.prepare()
         run.start()
     except Exception as exc:
         run.fatal = str(exc)
@@ -87,7 +98,10 @@ def stop(environment, **kwargs):
             print(f"TEST FAILED: {environment.parsed_options.scenario} — reporting: {exc}", flush=True)
         finally:
             try:
-                run.cleanup()
+                try:
+                    run.cleanup()
+                finally:
+                    run.data_preparation.restore()
             except Exception as exc:
                 environment.process_exit_code = 1
                 save_summary(environment.parsed_options.scenario, False, f"Cleanup failed: {exc}")

@@ -6,8 +6,7 @@ import subprocess
 import sys
 import time
 import tempfile
-import textwrap
-from itertools import zip_longest
+from textwrap import wrap
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -54,36 +53,57 @@ def failure_reason(report):
             reasons.append(f"Throughput {report['verified_per_second']:.2f}/s below target {thresholds.get('min_rps')}/s")
         elif check == "minimum_samples":
             reasons.append(f"Only {report['sent']} messages; minimum {thresholds.get('min_samples')}")
+        elif check in ("all_steps_verified", "no_failures"):
+            if not reasons:
+                reasons.append("Not all command steps completed successfully")
         else:
             reasons.append(check.replace("_", " "))
     return "; ".join(dict.fromkeys(str(reason) for reason in reasons)) or "Unspecified failure"
 
 
-def display_table(rows):
-    widths = (min(48, max([len("Test"), *(len(row[0]) for row in rows)])), 6, 60)
-    border = "+" + "+".join("-" * (width + 2) for width in widths) + "+"
+def display_results(rows):
+    for scenario, result, reason in rows:
+        print(f"{scenario}: {result}" + (f" — {reason}" if reason != "-" else ""), flush=True)
+
+
+def display_failed_tests(rows):
+    failed = [(scenario, reason) for scenario, result, reason in rows if result == "FAIL"]
+    print(f"\nTest cases: {len(rows) - len(failed)} passed, {len(failed)} failed, {len(rows)} total", flush=True)
+    if not failed:
+        return
+    print("\nFAILED TESTS", flush=True)
+    border = "+" + "-" * 60 + "+" + "-" * 74 + "+"
     print(border, flush=True)
-    print("| " + " | ".join(value.ljust(width) for value, width in zip(("Test", "Result", "Reason"), widths)) + " |", flush=True)
+    print(f"| {'Test case':<58} | {'Reason for failure':<72} |", flush=True)
     print(border, flush=True)
-    for row in rows:
-        cells = [textwrap.wrap(" ".join(str(value).split()), width) or [""] for value, width in zip(row, widths)]
-        for line in zip_longest(*cells, fillvalue=""):
-            print("| " + " | ".join(value.ljust(width) for value, width in zip(line, widths)) + " |", flush=True)
+    for scenario, reason in failed:
+        title = scenario.replace("_", " ")
+        titles = wrap(title, 58) or [""]
+        reasons = wrap(" ".join(reason.split()), 72) or [""]
+        for index in range(max(len(titles), len(reasons))):
+            left = titles[index] if index < len(titles) else ""
+            right = reasons[index] if index < len(reasons) else ""
+            print(f"| {left:<58} | {right:<72} |", flush=True)
         print(border, flush=True)
 
 
-def save_summary(scenario, passed, reason):
+def save_summary(scenario, passed, reason, report_path=None):
     path = os.getenv("PERF_RESULT_SUMMARY_FILE")
     if path:
-        Path(path).write_text(json.dumps({"scenario": scenario, "passed": passed, "reason": reason}))
+        destination = Path(path)
+        summary = json.loads(destination.read_text()) if destination.exists() else {}
+        summary.update(scenario=scenario, passed=passed, reason=reason)
+        if report_path is not None:
+            summary["report_path"] = str(report_path)
+        destination.write_text(json.dumps(summary))
 
 
 def display_result(report, report_path):
     verdict = "PASSED" if report["passed"] else "FAILED"
     print(f"\nTEST {verdict}: {report['scenario']}", flush=True)
     reason = "-" if report["passed"] else failure_reason(report)
-    display_table([(report["scenario"], "PASS" if report["passed"] else "FAIL", reason)])
-    save_summary(report["scenario"], report["passed"], reason)
+    display_results([(report["scenario"], "PASS" if report["passed"] else "FAIL", reason)])
+    save_summary(report["scenario"], report["passed"], reason, report_path)
     rate = report["failure_rate_percent"]
     rate_text = f"{rate:.2f}%" if rate is not None else "unavailable (no executions)"
     print(f"Executions: {report['verified']} successful, {report['failed']} failed | Failure rate: {rate_text}", flush=True)
@@ -93,12 +113,45 @@ def display_result(report, report_path):
     print(f"Report: {report_path}\n", flush=True)
 
 
+def aggregate_reports(reports, latencies):
+    successful = sum(report["verified"] for report in reports)
+    failed = sum(report["failed"] for report in reports)
+    sent = sum(report["sent"] for report in reports)
+    duration = sum(report["total_seconds_including_drain"] for report in reports)
+    if len(latencies) != successful:
+        raise ValueError("Suite execution timings do not match successful execution counts")
+    return {"sent": sent, "verified": successful, "failed": failed,
+            "failure_rate_percent": failed / sent * 100 if sent else None,
+            "avg_ms": sum(latencies) / successful if successful else None,
+            "p95_ms": percentile(latencies, 0.95), "p99_ms": percentile(latencies, 0.99),
+            "verified_per_second": successful / duration if duration > 0 else None,
+            "total_seconds_including_drain": duration}
+
+
+def display_suite_metrics(metrics):
+    print("\nCOMBINED METRICS — ALL TESTS", flush=True)
+    for label, key, unit in (("Average execution time", "avg_ms", "ms"),
+                            ("P95 execution time", "p95_ms", "ms"),
+                            ("P99 execution time", "p99_ms", "ms"),
+                            ("Throughput", "verified_per_second", "workflows/s"),
+                            ("Successful executions", "verified", ""),
+                            ("Failed executions", "failed", ""),
+                            ("Failure rate", "failure_rate_percent", "%")):
+        value = metrics[key]
+        text = "unavailable" if value is None else (
+            str(value) if key in ("verified", "failed") else f"{value:.2f} {unit}")
+        print(f"{label}: {text}", flush=True)
+
+
 def run_all_scenarios(scenarios, arguments):
     """Run each scenario in its own Locust process, retaining CLI overrides."""
     outcomes = {}
     rows = []
+    reports, groups, missing = [], {}, []
+    suite_output = ROOT / "performance" / "results" / ("suite-" + uuid4().hex)
+    suite_output.mkdir(parents=True)
     with tempfile.TemporaryDirectory(prefix="locust-summary-") as directory:
-        for scenario in sorted(scenarios):
+        for scenario in scenarios:
             print(f"\nRUNNING TEST: {scenario}", flush=True)
             summary_path = Path(directory) / f"{scenario}.json"
             env = dict(os.environ, PERF_RESULT_SUMMARY_FILE=str(summary_path))
@@ -109,17 +162,45 @@ def run_all_scenarios(scenarios, arguments):
                 summary["reason"] if summary and not summary["passed"]
                 else f"Process exited with code {code}; inspect terminal output")
             rows.append((scenario, "PASS" if code == 0 else "FAIL", reason))
+            if summary and summary.get("report_path"):
+                report_path = Path(summary["report_path"])
+                report = json.loads(report_path.read_text())
+                timings = json.loads((report_path.parent / "execution_timings.json").read_text())
+                reports.append(report)
+                group = groups.setdefault(report["measurement"], {"reports": [], "latencies": []})
+                group["reports"].append(report)
+                group["latencies"].extend(timings)
+            else:
+                missing.append(scenario)
     print("\nALL TESTS RESULTS", flush=True)
-    display_table(rows)
-    passed = bool(outcomes) and all(code == 0 for code in outcomes.values())
+    display_results(rows)
+    metrics = {}
+    for measurement, group in groups.items():
+        print(f"\nMeasurement: {measurement}", flush=True)
+        metrics[measurement] = aggregate_reports(group["reports"], group["latencies"])
+        display_suite_metrics(metrics[measurement])
+    if missing:
+        print(f"Metrics unavailable for: {', '.join(missing)}", flush=True)
+    passed = bool(outcomes) and all(code == 0 for code in outcomes.values()) and not missing
+    suite_report = {"passed": passed, "metrics_complete": not missing, "missing_reports": missing,
+                    "failed_tests": [{"scenario": scenario, "reason": reason}
+                                     for scenario, result, reason in rows if result == "FAIL"],
+                    "execution_metrics": metrics, "scenario_exit_codes": outcomes,
+                    "scenario_reports": reports, "command_arguments": arguments,
+                    "aggregation": "Timings pooled separately by measurement type. CLI timings include process startup; "
+                                   "worker timings measure submission until both output events. Individual failures fail the suite."}
+    suite_path = suite_output / "report.json"
+    suite_path.write_text(json.dumps(suite_report, indent=2))
+    print(f"Combined report: {suite_path}", flush=True)
+    display_failed_tests(rows)
     print(f"ALL TESTS {'PASSED' if passed else 'FAILED'}", flush=True)
     return 0 if passed else 1
 
 
 class WorkerScenario:
-    """Subclass supplies fixtures, setup, outcome checks, and stage-log checks."""
+    """Subclass supplies request data, setup, outcome checks, and stage-log checks."""
 
-    fixture = None
+    input_payload = None
     run_prefix = "scenario"
     metric_name = "Scenario"
     database_check_name = "database_postconditions"
@@ -210,7 +291,7 @@ class WorkerScenario:
         if not self.accepting:
             return
         correlation = f"{self.run_id}:{uuid4()}"
-        body = dict(self.fixture, schemaVersion=1, eventType="LineItemProcessingRequested", eventId=str(uuid4()),
+        body = dict(self.input_payload, schemaVersion=1, eventType="LineItemProcessingRequested", eventId=str(uuid4()),
                     occurredAt=datetime.now(timezone.utc).isoformat(), transactionId=str(uuid4()),
                     uploadedDocumentId=str(uuid4()), correlationId=correlation)
         started = time.monotonic()
@@ -331,6 +412,7 @@ class WorkerScenario:
                                  "min_samples": self.options.min_samples},
                   "database_after": after, "errors": self.errors, "fatal": self.fatal,
                   "worker_count": 1, "measurement": "submission until both result and post-OCR events observed"}
+        (self.output / "execution_timings.json").write_text(json.dumps(self.latencies))
         (self.output / "report.json").write_text(json.dumps(report, indent=2))
         self.environment.process_exit_code = 0 if report["passed"] else 1
         display_result(report, self.output / "report.json")
